@@ -12,6 +12,8 @@ from more_itertools import chunked
 from tqdm import tqdm
 
 from radiology_dataset_db.config import LOG_LEVEL
+from radiology_dataset_db.query_spec import (
+    _BLOCK_LABELS, QueryBlock, parse_query_blocks, render_query_blocks)
 
 logger = logging.getLogger(__name__)
 logger.setLevel(LOG_LEVEL)
@@ -33,15 +35,18 @@ def get_count(query):
 
 
 def split_query(query):
-    # assumes structure: (A OR B OR C) AND (X OR Y OR Z)
-    parts = query.split("AND")
-    left = parts[0].strip()[1:-1]   # remove parentheses
-    right = parts[1].strip()[1:-1]
-
-    left_terms = [t.strip() for t in left.split(" OR ")]
-    right_terms = [t.strip() for t in right.split(" OR ")]
-
-    return left_terms, right_terms
+    """
+    Split a query of the shape '(A OR B) AND (X OR Y) [NOT (...)]' into its first two
+    OR-blocks. NOT clauses, nested parentheses, and quoted phrases are handled correctly
+    (a naive query.split("AND") mangles all three).
+    """
+    blocks = [b for b in parse_query_blocks(query) if b.op == "AND"]
+    if len(blocks) < 2:
+        raise ValueError(
+            f"Expected at least two AND-blocks in the query, found {len(blocks)}. "
+            "Use parse_query_blocks() for queries with a different shape."
+        )
+    return list(blocks[0].terms), list(blocks[1].terms)
 
 
 def build_query(left_terms, right_terms):
@@ -50,29 +55,147 @@ def build_query(left_terms, right_terms):
     return f"({left}) AND ({right})"
 
 
-def drop_one_analysis(query):
-    left_terms, right_terms = split_query(query)
+def drop_one_analysis(query, sleep: float = 0.34):
+    """
+    Report the PubMed hit count of the query with each individual term removed.
 
-    results = []
+    Works on any number of AND/NOT blocks. Terms in a NOT block are labelled EXCLUDE;
+    removing one of those makes the query broader rather than narrower.
+    """
+    blocks = parse_query_blocks(query)
+    if not blocks:
+        raise ValueError("Could not parse any query blocks from the supplied query.")
 
-    base_count = get_count(query)
-    results.append(("BASE", base_count))
+    results = [("BASE", get_count(render_query_blocks(blocks)))]
 
-    # drop from left side
-    for i in range(len(left_terms)):
-        new_left = left_terms[:i] + left_terms[i+1:]
-        new_query = build_query(new_left, right_terms)
-        count = get_count(new_query)
-        results.append((f"DROP LEFT: {left_terms[i]}", count))
+    for block_index, block in enumerate(blocks):
+        if block_index < len(_BLOCK_LABELS):
+            label = _BLOCK_LABELS[block_index]
+        else:
+            label = f"{block.op}#{block_index + 1}"
 
-    # drop from right side
-    for i in range(len(right_terms)):
-        new_right = right_terms[:i] + right_terms[i+1:]
-        new_query = build_query(left_terms, new_right)
-        count = get_count(new_query)
-        results.append((f"DROP RIGHT: {right_terms[i]}", count))
+        for term_index, term in enumerate(block.terms):
+            reduced = [
+                QueryBlock(op=b.op, terms=list(b.terms))
+                for b in blocks
+            ]
+            reduced[block_index].terms = (
+                block.terms[:term_index] + block.terms[term_index + 1:]
+            )
+            reduced = [b for b in reduced if b.terms]
+            if not reduced:
+                continue
+            time.sleep(sleep)
+            results.append((f"DROP {label}: {term}", get_count(render_query_blocks(reduced))))
 
     return results
+
+
+# -----------------------------
+# SEED / TERM RESOLUTION
+# -----------------------------
+_PUBMED_URL_PATTERN = re.compile(r"pubmed\.ncbi\.nlm\.nih\.gov/(\d+)", re.IGNORECASE)
+_PMC_PATTERN = re.compile(r"(PMC\d+)", re.IGNORECASE)
+_DOI_PATTERN = re.compile(r"(10\.\d{4,9}/[^\s\"'<>]+)", re.IGNORECASE)
+
+
+def resolve_identifier_to_pmid(identifier: str, sleep: float = 0.34) -> Optional[str]:
+    """
+    Resolve a user-supplied paper reference to a PMID.
+
+    Accepts a bare PMID, a pubmed.ncbi.nlm.nih.gov URL, a PMCID or PMC URL, a bare DOI,
+    or a doi.org URL. Returns None if the reference cannot be resolved.
+    """
+    if not identifier:
+        return None
+
+    identifier = identifier.strip().rstrip("/")
+
+    # Bare PMID
+    if identifier.isdigit():
+        return identifier
+
+    # PubMed URL
+    url_match = _PUBMED_URL_PATTERN.search(identifier)
+    if url_match:
+        return url_match.group(1)
+
+    # PMCID / PMC URL -> resolve via elink
+    pmc_match = _PMC_PATTERN.search(identifier)
+    if pmc_match:
+        pmcid = pmc_match.group(1).upper()
+        try:
+            handle = Entrez.esearch(db="pubmed", term=f"{pmcid}[pmcid]", retmax=1)
+            record = Entrez.read(handle)
+            time.sleep(sleep)
+            if record["IdList"]:
+                return str(record["IdList"][0])
+        except Exception as e:
+            logger.warning(f"Failed to resolve {pmcid} to a PMID: {e}")
+        return None
+
+    # DOI (bare or inside a doi.org URL)
+    doi_match = _DOI_PATTERN.search(identifier)
+    if doi_match:
+        doi = doi_match.group(1).rstrip(".,;)")
+        try:
+            handle = Entrez.esearch(db="pubmed", term=f"{doi}[doi]", retmax=1)
+            record = Entrez.read(handle)
+            time.sleep(sleep)
+            if record["IdList"]:
+                return str(record["IdList"][0])
+            logger.warning(f"DOI {doi} did not resolve to any PubMed record.")
+        except Exception as e:
+            logger.warning(f"Failed to resolve DOI {doi} to a PMID: {e}")
+        return None
+
+    logger.warning(f"Could not interpret paper identifier: {identifier!r}")
+    return None
+
+
+def pmids_matching_query(pmids, query: str, batch_size: int = 100, sleep: float = 0.34) -> Set[str]:
+    """
+    Return the subset of pmids that the query retrieves.
+
+    Implemented as '(query) AND (pmid1[UID] OR pmid2[UID] ...)' so that checking a whole
+    seed set costs one esearch call instead of one call per seed, and never requires
+    downloading the full result set.
+    """
+    pmids = [str(p) for p in pmids if p]
+    if not pmids or not query or not query.strip():
+        return set()
+
+    matched: Set[str] = set()
+    for batch in chunked(pmids, batch_size):
+        uid_clause = " OR ".join(f"{pmid}[UID]" for pmid in batch)
+        term = f"({query}) AND ({uid_clause})"
+        try:
+            handle = Entrez.esearch(db="pubmed", term=term, retmax=len(batch))
+            record = Entrez.read(handle)
+            matched.update(str(pmid) for pmid in record["IdList"])
+        except Exception as e:
+            logger.error(f"Failed to test seed membership for a batch of {len(batch)} PMIDs: {e}")
+        time.sleep(sleep)
+
+    return matched
+
+
+def mesh_term_exists(term: str, sleep: float = 0.34) -> bool:
+    """
+    Check whether a string is a real MeSH descriptor, so that a proposed [MeSH] term is
+    grounded in the actual vocabulary rather than an LLM's guess at one.
+    """
+    term = (term or "").strip().strip('"')
+    if not term:
+        return False
+    try:
+        handle = Entrez.esearch(db="mesh", term=f'"{term}"[MeSH Terms]', retmax=1)
+        record = Entrez.read(handle)
+        time.sleep(sleep)
+        return int(record["Count"]) > 0
+    except Exception as e:
+        logger.warning(f"MeSH validation failed for {term!r}: {e}")
+        return False
 
 
 def extract_mesh_terms_union(pubmed_query: str) -> Set[str]:

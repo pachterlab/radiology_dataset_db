@@ -45,6 +45,63 @@ Modify `.env` and `radiology_dataset_db/config.py` as needed to customize PubMed
 python scripts/build_db.py --database-modality MODALITY
 ```
 
+## 🔎 Synthesizing a PubMed query for a new topic
+
+Writing the PubMed query is the step that previously required a human (see
+`notebooks/pubmed_search.ipynb` for the manual drop-one workflow). `scripts/build_query.py`
+does that search automatically: you describe the topic in plain language and, optionally,
+name a few papers that must (or must not) show up.
+
+```bash
+python scripts/build_query.py \
+  --topic "chest x-ray datasets" \
+  --must-include 31831740 10.1148/ryai.210315 https://pubmed.ncbi.nlm.nih.gov/36204533/ \
+  --must-exclude 12345678 \
+  --max-results 8000 \
+  --audit-sample 20
+```
+
+`--must-include` / `--must-exclude` accept PMIDs, DOIs, PubMed URLs, doi.org URLs, and PMCIDs.
+
+What it does:
+
+1. **Resolves and verifies your seeds.** Each must-include paper is fetched from PubMed and
+   checked by an LLM: is it on topic, and does it actually introduce a dataset? Papers that
+   fail are reported and dropped from the anchor set, so one bad example cannot drag the
+   whole query off topic (`--keep-rejected-seeds` overrides this, `--no-verify-seeds` skips it).
+2. **Proposes a query** of the form `(dataset terms) AND (topic terms) NOT (exclusions)`.
+   Every proposed `[MeSH]` term is checked against the real MeSH vocabulary; hallucinated
+   descriptors are downgraded to `[tiab]` rather than silently matching nothing.
+3. **Hillclimbs against live PubMed.** Each iteration measures the query and applies one
+   repair: recover a missing must-include paper (diagnosing *which* block excluded it),
+   exclude a must-exclude paper, prune a term that costs many hits but no required paper,
+   or broaden a query that is implausibly narrow. The LLM proposes vocabulary; PubMed
+   decides. An edit is kept only if the measured counts and seed membership improve, and
+   a term is never dropped if a must-include paper depends on it.
+4. **Optionally audits precision** (`--audit-sample N`): samples N results with a fixed
+   random seed and has the LLM judge how many are genuinely on-topic dataset papers. Hit
+   count tells you whether a query is big; this tells you whether it is right.
+
+The result is written to `topics/{slug}.json` — the query, the term-by-term hit
+contributions, the full iteration history, and the seed verdicts — and can be fed straight
+into the extraction pipeline:
+
+```bash
+python scripts/build_db.py --topic-spec topics/chest_x_ray_datasets.json --database-modality radiology
+```
+
+`--topic-spec` supplies the query; `--database-modality` still selects the extraction schema.
+
+To refine an existing hand-written query instead of starting from scratch:
+
+```bash
+python scripts/build_query.py --topic "radiology datasets" --start-modality radiology
+```
+
+Note that `--max-results` is a budget, not a guarantee: if the only way to fit it is to drop
+a term a must-include paper depends on, the agent keeps the paper and reports the overage.
+Seed recall is the constraint; result count is the objective.
+
 ## Currently supported modalities:
 - Radiology: `--database-modality radiology`
 - Single-cell RNA-seq: `--database-modality scrnaseq`

@@ -1,6 +1,7 @@
 import argparse
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
+import json
 import logging
 import math
 import os
@@ -38,6 +39,7 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Build database from PubMed and LLM extraction.")
 
     parser.add_argument("-m", "--database-modality", type=str, default="radiology", choices=SUPPORTED_MODALITIES, help=f"Modality of datasets to extract. Supported modalities: {SUPPORTED_MODALITIES}.")
+    parser.add_argument("--topic-spec", type=str, default=None, help="Path to a topic spec JSON written by scripts/build_query.py. Its query replaces the built-in query for --database-modality (which then only selects the extraction schema).")
     parser.add_argument("-o", "--output-path", type=str, default=None, help="Path to save the output CSV file. Defaults to data/{database_modality}_db.csv.")
     parser.add_argument("--output-path-failed", type=str, default=None, help="Path to save the CSV file containing metadata of articles for which dataset extraction failed.")
     parser.add_argument("-max", "--max-papers", type=int, default=9999, help="Maximum number of papers to retrieve from PubMed for processing.")
@@ -260,10 +262,19 @@ def save_progress(args, df_existing, extracted_datasets: List[dict], failed_meta
 async def main():
     args = parse_args()
 
-    pubmed_query = PUBMED_QUERY_DICT.get(args.database_modality)
-    pubmed_query = " ".join(pubmed_query.split())
-    if not pubmed_query:
-        raise ValueError(f"No PubMed query found for modality {args.database_modality}. Please check the config or specify a supported modality. Supported modalities: {SUPPORTED_MODALITIES}.")
+    if args.topic_spec:
+        with open(args.topic_spec) as handle:
+            topic_spec = json.load(handle)
+        pubmed_query = " ".join((topic_spec.get("query") or "").split())
+        if not pubmed_query:
+            raise ValueError(f"Topic spec {args.topic_spec} does not contain a 'query' field.")
+        logger.info(f"Using synthesized query from {args.topic_spec} (topic: {topic_spec.get('topic')!r})")
+        logger.info(f"Extraction schema comes from --database-modality {args.database_modality}.")
+    else:
+        pubmed_query = PUBMED_QUERY_DICT.get(args.database_modality)
+        pubmed_query = " ".join((pubmed_query or "").split())
+        if not pubmed_query:
+            raise ValueError(f"No PubMed query found for modality {args.database_modality}. Please check the config or specify a supported modality, or supply one with --topic-spec (see scripts/build_query.py). Supported modalities: {SUPPORTED_MODALITIES}.")
 
     if os.path.exists(args.output_path):
         if args.overwrite:
